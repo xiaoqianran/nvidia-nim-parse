@@ -12,8 +12,11 @@ import os
 
 import pymupdf as fitz
 import urllib.request
+from dotenv import load_dotenv
 
-ENDPOINT = os.environ.get("NIM_ENDPOINT", "https://newapi-jp1.202820.xyz/v1/chat/completions")
+load_dotenv()
+NIM_BASE = os.environ.get("NIM_ENDPOINT", "https://integrate.api.nvidia.com/v1")
+ENDPOINT = NIM_BASE.rstrip("/") + "/chat/completions"
 APIKEY = os.environ.get("NIM_API_KEY", "")
 MODEL = os.environ.get("NIM_MODEL", "nvidia/nemotron-parse")
 PDFDIR = os.environ.get("PDF_DIR", "./pdfs")
@@ -43,7 +46,10 @@ def parse_image(png_path):
     if tc:
         blocks = json.loads(tc[0]["function"]["arguments"])[0]
         return "\n".join(b.get("text", "") for b in blocks if b.get("text", "").strip())
-    return resp["choices"][0]["message"].get("content") or ""
+    md = resp["choices"][0]["message"].get("content") or ""
+    if not md.strip():
+        raise RuntimeError("接口返回空结果")
+    return md
 
 
 if __name__ == "__main__":

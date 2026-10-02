@@ -25,6 +25,7 @@ nvidia-nim-parse 并发文档解析工具
 import base64
 import json
 import os
+import io
 import glob
 import time
 import tempfile
@@ -33,14 +34,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pymupdf as fitz
 import urllib.request
 import urllib.error
+from PIL import Image, ImageOps
+from dotenv import load_dotenv
 
-ENDPOINT = os.environ.get("NIM_ENDPOINT", "https://newapi-jp1.202820.xyz/v1/chat/completions")
+load_dotenv()
+NIM_BASE = os.environ.get("NIM_ENDPOINT", "https://integrate.api.nvidia.com/v1")
+ENDPOINT = NIM_BASE.rstrip("/") + "/chat/completions"
 APIKEY = os.environ.get("NIM_API_KEY", "")
 MODEL = os.environ.get("NIM_MODEL", "nvidia/nemotron-parse")
 PDFDIR = os.environ.get("PDF_DIR", "./pdfs")
 OUTDIR = os.environ.get("OUT_DIR", os.path.join(PDFDIR, "md"))
 WORKERS = int(os.environ.get("WORKERS", "10"))
 DPI = int(os.environ.get("DPI", "200"))
+# 扫描件图像预处理：先按 UPSCALE 放大消除锯齿，再二值化去掉 JPEG 压缩噪点。
+# 对低分辨率扫描件（有效 DPI < 200）可显著提升识别准确率。
+UPSCALE = int(os.environ.get("UPSCALE", "2"))
+Binarize = os.environ.get("BINARIZE", "1") not in ("0", "false", "False")
+THRESHOLD = int(os.environ.get("THRESHOLD", "160"))
 MAX_TOKENS = 4096
 RETRIES = 4
 
@@ -49,8 +59,8 @@ def build_markdown(args_json):
     """arguments 形如 [[{bbox,text,type}, ...]]，转成带层级的 Markdown。"""
     try:
         blocks = json.loads(args_json)[0]
-    except Exception:
-        return ""
+    except Exception as e:
+        raise ValueError(f"无法解析 tool_calls.arguments: {e}")
     lines = []
     for b in blocks:
         t, txt = b.get("type"), (b.get("text") or "").strip()
@@ -67,13 +77,45 @@ def build_markdown(args_json):
     return "\n\n".join(lines)
 
 
+def _preprocess(img):
+    """按 UPSCALE 放大 + 可选二值化，压掉扫描件 JPEG 压缩噪点。"""
+    if UPSCALE > 1:
+        img = img.resize((img.width * UPSCALE, img.height * UPSCALE), Image.LANCZOS)
+    if Binarize:
+        img = ImageOps.autocontrast(img).point(lambda x: 255 if x > THRESHOLD else 0)
+    return img
+
+
 def render_page(pdf_path, page_idx):
+    """渲染指定页为PNG。
+
+    扫描件（无文本层）优先直接提取内嵌原图：内嵌图即扫描时的真实分辨率，
+    避免按 DPI 重采样引入插值伪影——这正是中文识别错字的主因。
+    """
     png = os.path.join(tempfile.gettempdir(),
                        f"_np_{os.getpid()}_{page_idx}_{int(time.time()*1000)}.png")
     doc = fitz.open(pdf_path)
-    doc[page_idx].get_pixmap(dpi=DPI).save(png)
-    doc.close()
+    try:
+        page = doc[page_idx]
+        imgs = page.get_images(full=True)
+        native = None
+        if not page.get_text().strip() and imgs:
+            # 扫描件：取面积最大的内嵌图
+            best = max(imgs, key=lambda im: im[2] * im[3])
+            native = doc.extract_image(best[0])["image"]
+        if native:
+            im = Image.open(io.BytesIO(native)).convert("L")
+            _preprocess(im).save(png)
+        else:
+            # 矢量PDF / 无内嵌图：按 DPI 渲染
+            page.get_pixmap(dpi=DPI).save(png)
+    finally:
+        doc.close()
     return png
+
+
+class EmptyResultError(RuntimeError):
+    """接口正常返回但解析结果为空（偶发），视为可重试失败。"""
 
 
 def call_parse(png_path):
@@ -97,10 +139,18 @@ def call_parse(png_path):
             resp = json.loads(urllib.request.urlopen(req, timeout=240).read())
             tc = resp["choices"][0]["message"].get("tool_calls")
             if tc:
-                return build_markdown(tc[0]["function"]["arguments"]), None
-            return resp["choices"][0]["message"].get("content") or "", None
+                md = build_markdown(tc[0]["function"]["arguments"])
+            else:
+                md = resp["choices"][0]["message"].get("content") or ""
+            if md and md.strip():
+                return md, None
+            # 空结果：接口没报错但没解析出内容，重试
+            last = EmptyResultError(f"第{attempt}次返回空结果")
+        except EmptyResultError as e:
+            last = e
         except Exception as e:
             last = e
+        if attempt < RETRIES:
             time.sleep(2 * attempt)
     return None, last
 
@@ -117,11 +167,12 @@ def process(pdf_path, page_idx, name):
     except OSError:
         pass
     dt = time.time() - t0
-    if err is None and md is not None:
+    if err is None and md and md.strip():
         with open(out, "w") as f:
             f.write(md)
         return name, page_idx + 1, "ok", dt
-    return name, page_idx + 1, f"err:{type(err).__name__}", dt
+    tag = f"err:{type(err).__name__}" if err is not None else "err:unknown"
+    return name, page_idx + 1, tag, dt
 
 
 def main():

@@ -1,9 +1,15 @@
-# 解析输出（按需保留/忽略）
-pdfs/md/
-*.png
+# 密钥与本地配置（切勿提交）
 .env
+
+# 解析产物
+pdfs/md/
+*.md.tmp
+
+# 临时渲染图
+/tmp/_np_*.png
+/tmp/_demo.png
 
 # Python
 __pycache__/
 *.pyc
-.DS_Store
+.venv/
