@@ -1,0 +1,9 @@
+# 解析输出（按需保留/忽略）
+pdfs/md/
+*.png
+.env
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
